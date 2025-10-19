@@ -1,7 +1,11 @@
 use anyhow::{Context, Result};
 use clap::Parser;
+use etcetera::app_strategy::Xdg;
 use gtk4::{CssProvider, Orientation, gio, glib};
 use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
+use regex::{Captures, Regex};
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -11,11 +15,19 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use std::{env, thread};
+use std::borrow::Cow;
+use std::mem::replace;
+use etcetera::AppStrategy;
 
 #[derive(Parser)]
 struct Args {
     #[arg(long, short)]
     daemon: bool,
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone)]
+struct Config {
+    replacements: HashMap<String, String>,
 }
 
 fn socket_path() -> PathBuf {
@@ -26,12 +38,63 @@ fn socket_path() -> PathBuf {
     }
 }
 
+fn compile_replacements(replacements: &HashMap<String, String>) -> Vec<(Regex, String)> {
+    let mut compiled: Vec<(Regex, String)> = vec![];
+
+    for (pattern, replacement) in replacements {
+        let new_pattern = format!(r"(\\)?(\b{}\b)", pattern);
+
+        match Regex::new(&new_pattern) {
+            Ok(re) => {
+                compiled.push((re, replacement.to_string()));
+            },
+            Err(e) => {
+                eprintln!("Failed to compile replacement '{}': {}", new_pattern, e);
+            }
+        }
+    }
+
+    compiled
+}
+
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
     let args = Args::parse();
 
+    let strategy = etcetera::choose_app_strategy(etcetera::AppStrategyArgs {
+        top_level_domain: "dev".to_string(),
+        author: "Junckes".to_string(),
+        app_name: "tts-overlay".to_string(),
+    })?;
+
+    let config_dir = strategy.config_dir();
+
+    if !config_dir.exists() {
+        fs::create_dir_all(&config_dir)?;
+    }
+
+    let config_file_path = strategy.in_config_dir("config.toml");
+
+    if !config_file_path.exists() {
+        let config = Config{
+            replacements: HashMap::new(),
+        };
+
+        fs::write(&config_file_path, toml::to_string(&config)?)?;
+    }
+
+    let config_contents = fs::read_to_string(&config_file_path)
+        .with_context(|| "failed to read config file")?;
+
+    let config: Config =
+        toml::from_str(&config_contents).with_context(|| "failed to parse config file")?;
+
+    println!("Read configuration from {}", config_file_path.display());
+
     if args.daemon {
-        run_daemon().await
+        let replacements = compile_replacements(&config.replacements);
+
+        run_daemon(replacements).await
     } else {
         run_ui().await
     }
@@ -39,7 +102,7 @@ async fn main() -> Result<()> {
 
 // runs the daemon, possibly the worst piece of code i've ever written
 // TODO: rewrite this in a less awful way
-async fn run_daemon() -> Result<()> {
+async fn run_daemon(replacements: Vec<(Regex, String)>) -> Result<()> {
     let sock = socket_path();
 
     if sock.exists() {
@@ -68,8 +131,9 @@ async fn run_daemon() -> Result<()> {
             // TODO: rewrite this as to not put the CPU on a spinlock, the previous method worked but it caused CTRL+C to not properly exit
             match listener.accept() {
                 Ok((stream, _addr)) => {
+                    let replacements = replacements.clone();
                     thread::spawn(move || {
-                        if let Err(e) = handle_client(stream) {
+                        if let Err(e) = handle_client(stream, replacements) {
                             eprintln!("client handler error: {e:#}");
                         }
                     });
@@ -108,7 +172,7 @@ async fn run_daemon() -> Result<()> {
     Ok(())
 }
 
-fn handle_client(s: UnixStream) -> Result<()> {
+fn handle_client(s: UnixStream, replacements: Vec<(Regex, String)>) -> Result<()> {
     let mut buf = String::new();
     let mut reader = BufReader::new(&s);
     reader.read_line(&mut buf)?;
@@ -117,8 +181,28 @@ fn handle_client(s: UnixStream) -> Result<()> {
         return Ok(());
     }
 
-    println!("Daemon received: {}", text);
-    tts_and_play(&text)
+    let to_play = process_replacements(&text, &replacements);
+
+    println!("Daemon received: \"{}\" -> \"{}\"", text, to_play);
+    tts_and_play(&to_play)
+}
+
+fn process_replacements(text: &str, replacements: &Vec<(Regex, String)>) -> String {
+    let mut current_text = text.to_string();
+
+    for (pattern, replacement) in replacements {
+        current_text = pattern.replace_all(&current_text, |caps: &Captures| {
+            if caps.get(1).is_some() {
+                caps.get(2)
+                    .map(|m| m.as_str().to_string())
+                    .unwrap_or_default()
+            } else {
+                replacement.clone()
+            }
+        }).to_string();
+    }
+
+    current_text
 }
 
 fn tts_and_play(text: &str) -> Result<()> {
