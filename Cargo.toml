@@ -2,7 +2,6 @@
 name = "tts-overlay"
 version = "0.1.0"
 edition = "2024"
-license-file = "LICENSE.md"
 license = "BSD-3"
 
 [dependencies]

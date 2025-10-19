@@ -1,7 +1,5 @@
 use anyhow::{Context, Result};
 use clap::Parser;
-use gtk4::gdk::Key;
-use gtk4::prelude::{EditableExt, EntryExt, GtkWindowExt, WidgetExt};
 use gtk4::{CssProvider, Orientation, gio, glib};
 use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
 use std::fs;
@@ -57,7 +55,7 @@ async fn run_daemon() -> Result<()> {
 
     println!("Daemon listening on: {}", sock.display());
 
-    // i fucking hate this code and it should probably be redone to not look so hideous
+    // I fucking hate this code, and it should probably be redone to not look so hideous
     let running = Arc::new(AtomicBool::new(true));
     let running_clone = running.clone();
 
@@ -124,7 +122,7 @@ fn handle_client(s: UnixStream) -> Result<()> {
 }
 
 fn tts_and_play(text: &str) -> Result<()> {
-    let tmp = std::env::temp_dir().join(format!("tts_overlay_tts_{}.wav", std::process::id()));
+    let tmp = env::temp_dir().join(format!("tts_overlay_tts_{}.wav", std::process::id()));
 
     let status = Command::new("espeak")
         .arg("-w")
